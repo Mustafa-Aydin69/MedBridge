@@ -1,0 +1,150 @@
+# CLAUDE.md — MedBridge
+
+> Bu dosya Claude Code için proje bağlamıdır. Kod yazmadan önce mimari kararlara,
+> "Tıbbi ve Güvenlik Çerçevesi"ne ve "Kritik Dikkat Noktaları"na uy. Meşru bir
+> kronik hastalık takip kategorisidir, ama **eşik uyarıları** ve **hekim paylaşımı**
+> doğrudan **hasta güvenliği** alanına girer — en yüksek dikkat oraya.
+
+## Proje Özeti
+
+MedBridge, diyabet ve hipertansiyon gibi düzenli takip gerektiren kronik
+hastalıklarda hastanın günlük sağlık verisini kaydettiği ve hekimiyle güvenli,
+yapılandırılmış biçimde paylaştığı bir "sağlık köprüsü"dür. İki taraf:
+**hasta mobil** + **hekim web paneli**.
+
+**Tek cümlede değer:** "Ölçümlerini düzenli kaydet, hekiminle güvenli ve düzenli
+paylaş." *(Tedavi/doz önermez, acil durum sistemi değildir — bkz. çerçeve.)*
+
+## Teknoloji Yığını
+
+- **Hasta mobil:** **Flutter** *(RN alternatif; erişilebilirlik + diğer
+  projelerinle tutarlılık)*. İleri yaş için: büyük buton, yüksek kontrast,
+  screen-reader, sade akış.
+- **Hekim web:** **Next.js** (React) — poliklinikte masaüstü, detaylı grafik analizi.
+- **Backend:** **NestJS** *(CLAUDE önerisi — FastAPI alternatif; hekim paneli
+  Next.js/TS olduğu için NestJS ile uçtan uca TypeScript + paylaşılan tipler).*
+  REST (GraphQL gerekirse sonra).
+- **Veritabanı:** **PostgreSQL** (ilişkisel hasta-hekim ağacı) + ölçüm zaman serisi
+  için **TimescaleDB** uzantısı. Sağlık değerleri **field-level şifreli**;
+  **audit logging** zorunlu.
+- **Grafik:** **Recharts** (web) + mob'da fl_chart/Chart.js.
+
+## Repo Yapısı (hedeflenen monorepo)
+
+```
+medbridge/
+├── CLAUDE.md
+├── backend/                # NestJS
+│   └── src/
+│       ├── auth/
+│       ├── measurements/   # ölçüm ingest + zaman serisi
+│       ├── journal/        # beslenme/ruh hali/semptom
+│       ├── thresholds/     # HEKİMİN belirlediği kişiye-özel sınırlar
+│       ├── alerts/         # eşik dışı tetikler
+│       ├── sharing/        # güvenli, süreli, kapsamlı erişim
+│       └── audit/          # her erişim loglanır
+├── mobile/                 # Flutter — hasta
+└── web-doctor/             # Next.js — hekim paneli
+```
+
+## Veritabanı Şeması (özet)
+
+```sql
+CREATE TABLE users (
+  id UUID PRIMARY KEY, role TEXT CHECK (role IN ('patient','doctor')),
+  email TEXT UNIQUE, created_at TIMESTAMPTZ DEFAULT now()
+);
+
+-- Ölçümler (TimescaleDB hypertable) — değerler şifreli
+CREATE TABLE measurements (
+  id UUID PRIMARY KEY, patient_id UUID REFERENCES users(id) ON DELETE CASCADE,
+  type TEXT,                 -- glucose | bp_systolic | bp_diastolic | pulse | weight
+  value NUMERIC, unit TEXT,  -- glucose: mg/dL (TR) — birim AÇIK tutulmalı (#7)
+  context TEXT,              -- fasting/postprandial vb.
+  measured_at TIMESTAMPTZ NOT NULL
+);
+
+CREATE TABLE journal_entries (
+  id UUID PRIMARY KEY, patient_id UUID, entry_at TIMESTAMPTZ,
+  nutrition TEXT, mood TEXT, symptoms TEXT
+);
+
+-- Eşikler: HEKİM belirler (hardcode değil — #2)
+CREATE TABLE thresholds (
+  patient_id UUID, type TEXT, low NUMERIC, high NUMERIC,
+  set_by UUID REFERENCES users(id), updated_at TIMESTAMPTZ,
+  PRIMARY KEY (patient_id, type)
+);
+
+CREATE TABLE alerts (
+  id UUID PRIMARY KEY, patient_id UUID, measurement_id UUID,
+  kind TEXT, triggered_at TIMESTAMPTZ, notified_doctor BOOLEAN DEFAULT FALSE
+);
+
+-- Güvenli paylaşım: süreli, kapsamlı, iptal edilebilir, loglu (#6)
+CREATE TABLE access_grants (
+  id UUID PRIMARY KEY, patient_id UUID,
+  doctor_id UUID,                 -- veya null + token (tek kullanımlık link)
+  token_hash TEXT,                -- ham token saklanmaz
+  scope_from DATE, scope_to DATE, scope_types TEXT[],  -- yalnızca seçilen aralık/metrik
+  expires_at TIMESTAMPTZ, revoked BOOLEAN DEFAULT FALSE, single_use BOOLEAN DEFAULT TRUE
+);
+
+CREATE TABLE audit_log (
+  id BIGSERIAL PRIMARY KEY, actor UUID, action TEXT, target_patient UUID,
+  detail JSONB, at TIMESTAMPTZ DEFAULT now()
+);
+```
+
+## Tıbbi ve Güvenlik Çerçevesi (her şeyden önce gelir)
+
+- **Kayıt + paylaşım aracı; tanı/tedavi cihazı değil.** Uygulama **doz/tedavi
+  önermez** (ör. "şu kadar insülin yap" ASLA). Tedavi tavsiyesi ürünü tıbbi cihaz
+  (SaMD) kapsamına sokar ve doğrudan zarar riski taşır.
+- **Acil durum sistemi DEĞİL.** Push bildirimi gerçek zamanlı/garanti değildir
+  (cihaz kapalı, DND, OS kısıtlaması). Uygulama hiçbir yerde "acil durumda seni
+  koruruz" izlenimi vermemeli. Eşik uyarısı net biçimde: "Bu değer hekiminizin
+  belirlediği aralığın dışında — hekiminize danışın / gerekirse 112'yi arayın."
+- **Eşikleri HEKİM belirler.** Hipoglisemi/hipertansif kriz sınırları hastaya göre
+  değişir. Popülasyon eşiklerini hardcode etme; hekim kişiye-özel ayarlar. Güvenli
+  varsayılan yalnızca fallback + disclaimer ile.
+- **Yanlış negatif tehlikelidir.** Eşik dışı bir değer alarm üretmezse bu gerçek
+  zarardır. Alarm mantığı muhafazakâr ama **bastırmasız** olmalı; "iyi görünüyor"
+  gibi güven verici tıbbi yorum yapma.
+- **"Hekime risk bildirimi" 7/24 izleme vaadi DEĞİL.** Hekimin paneline düşen
+  bildirim, birinin sürekli izlediği anlamına gelmez. Sürekli klinik gözetim
+  izlenimi yaratma; bildirim hekim tarafından randevuda/uygun olduğunda görülür.
+- **Özel nitelikli veri.** Sağlık verisi KVKK m.6 / HIPAA / GDPR special category:
+  açık rıza, encryption at rest, **audit logging**, amaç sınırlaması.
+
+## Kritik Dikkat Noktaları (gotchas)
+
+1. **Tedavi yorumu yok.** Kod ve metinler ölçümü gösterir/işaretler; doz, ilaç,
+   "şunu yap" tarzı tıbbi yönlendirme üretmez.
+2. **Birim karmaşası = hasta güvenliği.** Glikoz mg/dL vs mmol/L; tansiyon
+   sistolik/diastolik. Birim her kayıtta açık saklanmalı; grafik ve eşik
+   karşılaştırması birim-duyarlı olmalı.
+3. **Girdi doğrulama.** İmkânsız/typo değerler (glikoz 4000, tansiyon 30/900) hem
+   trendi bozar hem yanlış alarm üretir. Makul aralık + onay sorusu ile yakala.
+4. **Güvenli paylaşım yüzeyi (#1 güvenlik özelliği).** Erişim kodu/link: **süreli,
+   kapsam-sınırlı (sadece seçilen tarih aralığı + metrik), iptal edilebilir,
+   tek-kullanımlık/ kısa TTL, audit-loglu**. Uzun ömürlü herkese-açık link ile PHI
+   sızdırma. Ham token saklama (`token_hash`).
+5. **Yetkilendirme & audit.** Hekim yalnızca kendisine erişim verilen hastayı
+   görür (RLS/authz); her erişim `audit_log`'a yazılır.
+6. **Eşik testi.** Alert mantığı için kapsamlı birim test (sınırda, sınır altı/üstü,
+   eksik birim, eski ölçüm). Bu mantık sessizce bozulursa kimse fark etmez —
+   testle koru.
+7. **Zaman dilimi & bağlam.** `measured_at` saat dilimi açık (`Europe/Istanbul`);
+   açlık/tokluk bağlamı glikoz yorumunu değiştirir, birlikte sakla.
+
+## Yol Haritası (önerilen MVP sırası)
+
+1. **Kayıt + grafik:** ölçüm girişi (birim/bağlam + doğrulama), zaman serisi
+   grafikleri, sağlık günlüğü. Erişilebilir hasta arayüzü.
+2. **Eşik & uyarı:** hekim-ayarlı eşikler, muhafazakâr/bastırmasız alarm, doğru
+   çerçeveli (acil-değil) bildirim.
+3. **Güvenli paylaşım + hekim paneli:** süreli/kapsamlı erişim, audit log, hekim
+   web grafikleri ve dışa aktarım.
+4. **Hekime risk bildirimi (opsiyonel, rıza ile):** 7/24 izleme vaadi olmadan.
+5. **Sertleştirme:** field-level şifreleme, audit kapsamı, eşik mantığı testleri.
